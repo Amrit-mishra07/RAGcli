@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-cli"
+version = "0.1.0"
+description = "RAG CLI — ask natural-language questions about a codebase."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "ollama>=0.4.0",
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+rag = "rag.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rag*"]
