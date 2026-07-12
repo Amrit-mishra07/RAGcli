@@ -1,181 +1,132 @@
 # RAG CLI
 
-A local, open-source Retrieval-Augmented Generation CLI tool that lets you ask natural-language questions about a codebase and get grounded answers with source citations.
+A local, open-source Retrieval-Augmented Generation (RAG) CLI tool that lets you ask natural-language questions about a codebase and get grounded answers with source citations.
 
 Everything runs **locally** — no paid APIs, no cloud services. Powered by [Ollama](https://ollama.com/) for both embeddings and generation, and [FAISS](https://github.com/facebookresearch/faiss) for vector search.
 
-## Features
+---
 
-- **Code-aware chunking** — splits files on function/class boundaries where possible, not just arbitrary token counts.
-- **Persistent index** — FAISS index + metadata stored on disk; survives process restarts.
-- **Idempotent ingestion** — re-running `rag index` skips unchanged files.
-- **Streaming answers** — LLM output streams to your terminal in real-time.
-- **Source citations** — every answer includes exact file paths and line ranges.
-- **Automatic model selection** — detects available VRAM/RAM and picks the largest Qwen 2.5 Coder variant your system can handle.
+## Architecture & How It Works
+
+RAG CLI operates as a two-phase pipeline: **Ingestion (Indexing)** and **Retrieval & Generation (Querying)**.
+
+```mermaid
+flowchart TD
+    subgraph Ingestion Pipeline [1. Ingestion / Indexing]
+        A[Walk Repo] --> B[Filter Ignored & Binary]
+        B --> C[Read UTF-8 Text]
+        C --> D[Code-Aware Chunker]
+        D --> E[Ollama Embeddings nomic-embed-text]
+        E --> F[(FAISS Vector Store)]
+        D --> G[(JSON Metadata Sidecar)]
+    end
+
+    subgraph Query Pipeline [2. Retrieval & Generation]
+        H[User Query] --> I[Ollama Embeddings nomic-embed-text]
+        I --> J[Search top-k Vectors]
+        F --> J
+        J --> K[Retrieve Source Text + Ranges]
+        G --> K
+        K --> L[Construct System Prompt]
+        L --> M[Ollama Generation qwen2.5-coder]
+        M --> N[Streamed Answer & Citations]
+    end
+```
+
+### 1. Ingestion Pipeline
+*   **Directory Walking (`rag/ingest.py`)**: Recursively lists files in the target repository. Employs aggressive ignore heuristics (skipping `.git`, `node_modules`, binary artifacts, and files > 1 MB) and inspects the first 8 KB of each file for null bytes to filter out binary payloads.
+*   **Code-Aware Chunking (`rag/chunker.py`)**: Instead of dividing files strictly by token count, the chunker uses a sliding window (targeting ~300-500 tokens, estimate based on character density). To preserve semantic context in code:
+    *   It looks for functional entry points (e.g. `def`, `class`, `function`, `fn`, `impl`) or blank lines using proximity heuristics.
+    *   It splits before these logical boundaries rather than cutting mid-statement.
+    *   It maintains a configurable overlap (~50 tokens) to preserve transition contexts.
+*   **Embedding & Storage (`rag/store.py` & `rag/embeddings.py`)**: 
+    *   Generates a 768-dimension vector for each chunk using Ollama's `nomic-embed-text` model.
+    *   The vectors are L2-normalized and added to a FAISS `IndexFlatIP` (Inner Product, which represents cosine similarity for normalized vectors).
+    *   A parallel metadata sidecar stores chunk source attributes (`file_path`, `start_line`, `end_line`, and `text`) mapping 1-to-1 with the FAISS vector indices.
+    *   To keep indexing fast and idempotent, SHA-256 hashes of all files are tracked. Re-running `rag index` skips any unchanged files.
+
+### 2. Query Pipeline
+*   **Vector Search**: The user's query is vectorized via the same embedding model. FAISS retrieves the top $k$ chunks with the highest inner-product similarity scores.
+*   **Prompt Construction (`rag/query.py`)**:
+    The system compiles the retrieved chunks into a context block and feeds them to the LLM alongside the query. A strict system instruction prevents hallucination:
+    > "Answer the user's question based ONLY on the provided source code context. If the context doesn't contain enough information, say so clearly."
+*   **Streaming & Citation**: The answer is streamed back in real-time, accompanied by a concluding "Sources" block listing exact files, matching line ranges, and similarity scores.
+
+### 3. Smart Model Selection (`rag/models.py`)
+To make the tool hardware-agnostic, RAG CLI dynamically queries system specifications at runtime:
+*   It checks physical RAM using OS parameters and queries NVIDIA VRAM via `nvidia-smi`.
+*   It compares the maximum available memory resource against model requirements (Qwen2.5-Coder weights ranging from 0.5B up to 7B parameters) and selects the largest model your machine can safely execute.
+
+---
 
 ## Setup
 
 ### Prerequisites
+*   **Python 3.11+**
+*   **Ollama** (Automatically configured in the custom step below, or installable via [ollama.com](https://ollama.com/))
 
-- **Python 3.11+**
-- **Ollama** — install from [ollama.com](https://ollama.com/)
-
-### 1. Install Ollama and pull models
-
+### 1. Install RAG CLI
 ```bash
-# Install Ollama (if not already installed)
-curl -fsSL https://ollama.com/install.sh | sh
+# Clone the repository
+git clone git@github.com:Amrit-mishra07/RAGcli.git
+cd RAGcli
 
-# Start the Ollama server (if not already running)
-ollama serve &
-
-# Pull the required models
-ollama pull nomic-embed-text        # embedding model (~274 MB)
-ollama pull qwen2.5-coder:7b       # generation model (~4.7 GB)
-
-# If your machine has < 8 GB RAM/VRAM, use a smaller variant:
-# ollama pull qwen2.5-coder:3b     # ~2.0 GB
-# ollama pull qwen2.5-coder:1.5b   # ~1.0 GB
-```
-
-### 2. Install RAG CLI
-
-```bash
-# Clone the repo
-git clone <repo-url> && cd RAGcli
-
-# Install in a virtual environment (recommended)
+# Set up a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
+# Install package in editable mode
 pip install -e .
 ```
 
+### 2. Configure Local Ollama (Handling Low Disk Space)
+If your `/home` partition is nearly full (e.g. less than 1-2 GB remaining), Ollama will fail to download models to `~/.ollama` by default. You can redirect storage to your root `/var/tmp` directory (which has more free space) using this script:
+
+```bash
+# 1. Download the standalone Ollama bundle to /var/tmp
+curl -L https://ollama.com/download/ollama-linux-amd64.tar.zst -o /var/tmp/ollama-linux-amd64.tar.zst
+mkdir -p /var/tmp/ollama_root
+tar -xvf /var/tmp/ollama-linux-amd64.tar.zst -C /var/tmp/ollama_root
+rm -f /var/tmp/ollama-linux-amd64.tar.zst
+
+# 2. Start the daemon redirecting model downloads to root
+nohup env OLLAMA_MODELS=/var/tmp/ollama_models /var/tmp/ollama_root/bin/ollama serve >/var/tmp/ollama_serve.log 2>&1 &
+
+# 3. Pull the required models (Embedding + Light/Fast Generation variant)
+env OLLAMA_MODELS=/var/tmp/ollama_models /var/tmp/ollama_root/bin/ollama pull nomic-embed-text
+env OLLAMA_MODELS=/var/tmp/ollama_models /var/tmp/ollama_root/bin/ollama pull qwen2.5-coder:1.5b
+```
+
+---
+
 ## Usage
 
-### Index a repository
-
+### Index a Repository
 ```bash
 rag index /path/to/your/codebase
 ```
+*Outputs are saved to `~/.rag_index/`.*
 
-This will:
-1. Walk the directory, skipping binary files, `.git`, `node_modules`, build artifacts, etc.
-2. Split each text/code file into overlapping chunks (~300-500 tokens).
-3. Embed all chunks via the local Ollama embedding model.
-4. Store the FAISS index and metadata in `~/.rag_index/`.
-
-Progress is logged as files are processed. Re-running the command on the same repo skips unchanged files.
-
-### Ask a question
-
+### Query the Codebase
 ```bash
-rag ask "How does the authentication middleware work?"
+rag ask "How is the cosine similarity calculated?"
 ```
 
 Options:
-- `--k N` — number of source chunks to retrieve (default: 5)
+*   `--k N` (Default: 5): The number of source chunks to retrieve.
+    ```bash
+    rag ask "Explain the walk_repo implementation details" --k 3
+    ```
 
-```bash
-rag ask "What does the parse_config function do?" --k 10
-```
+---
 
-### Other options
+## v1 Next Steps (Planned Enhancements)
+*   **Hybrid Search**: Combine dense FAISS vector embeddings with sparse BM25 keyword searches.
+*   **Cross-Encoder Reranking**: Re-evaluate top-k vectors using a reranker model for higher contextual accuracy.
+*   **AST Chunker**: Integrate `tree-sitter` to break chunks strictly along programming grammar (AST parse trees) instead of regex heuristics.
+*   **Conversation Memory**: Support session states for follow-up conversational flows.
 
-```bash
-rag --help           # show top-level help
-rag index --help     # help for the index command
-rag ask --help       # help for the ask command
-rag -v index ./src   # verbose/debug logging
-```
-
-### Running without installing
-
-```bash
-# Alternative: run directly as a Python module
-python -m rag index /path/to/repo
-python -m rag ask "What does main() do?"
-```
-
-## Example Session
-
-```
-$ rag index ~/projects/my-api
-
-Embedding model : nomic-embed-text
-Index directory : /home/user/.rag_index
-Repo            : /home/user/projects/my-api
-
-Scanning repository...
-Found 142 files to process.
-
-  [10/142] src/routes/auth.ts  (3 chunks)
-  [20/142] src/middleware/cors.ts  (1 chunks)
-  ...
-  [142/142] tests/unit/auth.test.ts  (4 chunks)
-
-Done in 38.2s. 142 files indexed, 0 unchanged, 487 chunks stored (487 total vectors).
-
-$ rag ask "How does JWT validation work in the auth middleware?"
-
-✓ Generation model: qwen2.5-coder:7b  (selected for 16384 MB RAM)
-
-────────────────────────────────────────────────────────
-Answer:
-────────────────────────────────────────────────────────
-The JWT validation is handled in `src/middleware/auth.ts`. The `validateToken`
-function (lines 24-41) extracts the Bearer token from the Authorization header,
-then calls `jwt.verify()` with the secret from `config.JWT_SECRET`. If
-verification fails, it returns a 401 response...
-
-────────────────────────────────────────────────────────
-Sources:
-  [1] src/middleware/auth.ts  (lines 18-52, similarity 0.847)
-  [2] src/config/index.ts  (lines 1-28, similarity 0.721)
-  [3] src/routes/auth.ts  (lines 55-89, similarity 0.698)
-  [4] tests/unit/auth.test.ts  (lines 1-34, similarity 0.654)
-  [5] src/types/auth.ts  (lines 1-19, similarity 0.612)
-────────────────────────────────────────────────────────
-```
-
-## Architecture
-
-```
-rag/
-├── cli.py          # argparse CLI entry point
-├── config.py       # constants, paths, ignore patterns
-├── ingest.py       # repo walker — yields text files with metadata
-├── chunker.py      # code-aware chunking with overlap
-├── embeddings.py   # Ollama embedding client
-├── store.py        # FAISS index + JSON metadata persistence
-├── models.py       # VRAM/RAM detection + model selection
-└── query.py        # retrieve → prompt → generate pipeline
-```
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `Cannot connect to Ollama` | Run `ollama serve` in another terminal |
-| `No embedding model found` | Run `ollama pull nomic-embed-text` |
-| `Model '...' isn't pulled yet` | Run the `ollama pull <model>` command shown in the error |
-| `No index found` | Run `rag index <repo_path>` before `rag ask` |
-| Index seems stale | Delete `~/.rag_index/` and re-index |
-
-## Next Steps (v1 — out of scope for v0)
-
-The following improvements are planned but **deliberately not implemented** in this version:
-
-- **Hybrid search** — combine vector similarity with BM25 keyword matching for better recall.
-- **Reranking** — use a cross-encoder reranker on the top-k results before passing to the LLM.
-- **Incremental re-indexing** — detect file changes at the chunk level instead of re-processing entire files.
-- **AST-aware chunking** — use tree-sitter for language-aware parsing instead of regex heuristics.
-- **Knowledge graph** — extract and link entities (functions, classes, imports) across files.
-- **Multi-repo support** — index and query across multiple repositories.
-- **Cloud deployment** — serve the index and LLM behind an API for team usage.
-- **Conversation memory** — support follow-up questions within a session.
+---
 
 ## License
-
 MIT
